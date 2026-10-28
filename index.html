@@ -75,11 +75,15 @@ const PAGE_SRC = "<!doctype html>\n" + document.documentElement.outerHTML;
    CONFIG — edit this block
    ===================================================================== */
 const CONFIG = {
-  // The melody, as [note, beats]. Note names like "C4", "F#3", "Bb4".
+  // The melody. Any of these work:
+  //   ["C", "G", "Bb"]               plain note names
+  //   ["C4", "G4:2", "Bb4"]          with octaves, ":2" = a long note
+  //   [["C4", 1], ["G4", 2]]         [note, beats] pairs
+  //   "C4 G4:2 Bb"                   one string
+  // A note without an octave number takes the octave closest to the note before it.
   // Rhythm is never checked. Octave and beats shape the star hint
   // (height = pitch, spacing and flash length = rhythm).
-  // Back-to-back repeats of the same note only need to be played once.
-  // THIS IS A TEST SCALE. Replace it with your melody.
+  // Back-to-back repeats of the same note only need to be sung once.
   SEQUENCE: ["C", "G", "B", "G", "C", "B", "A", "G", "A", "B", "G"],
   BEAT_SECONDS: 0.5,          // tempo of the star hint
   HINT_GAP_SECONDS: 2,        // pause before the hint repeats
@@ -196,7 +200,16 @@ const exactOctave = () => cfg.MATCH === "intervals" && cfg.OCTAVE_MATTERS;
 const notes = [];   // one star per note in SEQUENCE
 const steps = [];   // what they have to play (back-to-back repeats merged)
 let totalBeats = 0, configError = "";
+// Accepts every SEQUENCE format listed in CONFIG and turns it into [note, beats] pairs.
+function normalizeSequence(seq) {
+  if (typeof seq === "string") return parseMelody(seq);
+  if (!Array.isArray(seq)) throw new Error("SEQUENCE should be a list of notes.");
+  return parseMelody(seq.map(x => Array.isArray(x)
+    ? String(x[0]).trim() + (x[1] !== undefined && x[1] !== null ? ":" + x[1] : "")
+    : String(x).trim()).join(" "));
+}
 try {
+  CONFIG.SEQUENCE = normalizeSequence(CONFIG.SEQUENCE);
   for (const [name, beats] of CONFIG.SEQUENCE) {
     const midi = toMidi(name);
     notes.push({ midi, pc: mod12(midi), beats: +beats || 1, start: totalBeats, step: 0, x: 0, y: 0 });
