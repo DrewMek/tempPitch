@@ -95,13 +95,19 @@ const CONFIG = {
   MATCH: "intervals",
   OCTAVE_MATTERS: false,      // intervals only: if true, jumps must go the right
                               // direction and size (up 5 is not down 7)
+  INTERVAL_TOLERANCE: 0.75,   // intervals only: how far off a sung jump can be
+                              // (in semitones) and still count
 
   // Detection. Tune these at the real spot with ?debug on the URL.
   MIN_DB: -50,                // sounds quieter than this are ignored
-  CLARITY: 0.8,               // 0-1, how cleanly pitched a sound must be
-  HOLD_MS: 140,               // a note must be steady this long to count
-  WRONG_RESETS: true,         // does a held wrong note reset progress?
-  WRONG_HOLD_MS: 400,         // ...only if it's held at least this long
+  CLARITY: 0.7,               // 0-1, how cleanly pitched a sound must be
+  HOLD_MS: 120,               // a note must be steady this long to count
+  MISTAKES_ALLOWED: 0,        // wrong notes allowed per attempt; one more starts it over.
+                              // 0 = the first wrong note starts it over
+  WRONG_HOLD_MS: 400,         // a wrong note held this long is always a mistake, even if
+                              // it slides into the right note afterwards
+  COOLDOWN_S: 3,              // after an attempt fails on mistakes, the stars stop listening
+                              // this long. 0 turns it off.
   SILENCE_RESET_MS: 3000,     // a pause longer than this resets progress
   MIN_HZ: 70,
   MAX_HZ: 1200
@@ -254,7 +260,7 @@ let parts = [], deb = [], revealed = false, running = true, lastT = performance.
 let ac = null, master = null, stream = null, analyser = null, buf = null, ds = null, nsdfBuf = null;
 let listening = false;
 let live = { db: -120, freq: 0, clar: 0, voiced: false, midiF: 0, pc: -1 };
-let candF = null, candSince = 0, done = false, samples = [], lastF = 0, lastIv = null;
+let candF = null, candSince = 0, done = false, samples = [], lastF = 0, lastErr = null, keyEst = 0, keyN = 0;
 let lastVoiced = 0, unvoicedSince = 0, lastHeard = 0;
 
 function ensureAudio() {
@@ -373,48 +379,115 @@ function detect(now) {
 }
 
 /* ---------- note logic ---------- */
+// Mistakes: each attempt allows cfg.MISTAKES_ALLOWED wrong notes; one more and it starts over.
+// Honest misses are forgivable, but guessing through note by note (watching for stars to
+// light) runs out of mistakes almost immediately. Any wrong note that gets judged counts,
+// however short, so a quick sweep through notes can't sneak past. The one exception: a wrong
+// note that slides straight into the right one (no pause) is forgiven, since singers often
+// land a little off and correct. Only the last wrong note before a right one gets that pass.
+let strikes = 0;        // mistakes so far this attempt
+let pending = false;    // a wrong note was just sung; forgiven only if it slides into the right note
+let candWrong = false, candStruck = false;
 // In interval mode the first note is free, so a reset only "counts" once a real jump was matched.
 const progressed = () => step >= (cfg.MATCH === "intervals" ? 2 : 1);
 function median(a) {
   const s = a.slice().sort((x, y) => x - y), m = s.length >> 1;
   return s.length % 2 ? s[m] : (s[m - 1] + s[m]) / 2;
 }
+function newAttempt() { step = 0; strikes = 0; pending = false; }
+function strike() {
+  pending = false;
+  if (step === 0) return;                      // nothing to lose before the first note
+  strikes++;
+  if (strikes > cfg.MISTAKES_ALLOWED) { miss = 1; newAttempt(); done = true; startCooldown(); }
+  else miss = Math.max(miss, 0.6);
+}
+
+// Short cooldown after a failed attempt. It survives a reload (stored with a wall-clock end
+// time), so refreshing doesn't skip it.
+const COOL_KEY = "supernova-cool-" + (params.get("s") || "default").slice(0, 64);
+let coolN = 0, coolUntil = 0;                  // coolN counts failed attempts; coolUntil is in performance.now() time
+if (params.has("reset")) store.del(COOL_KEY);
+try {
+  const c = JSON.parse(store.get(COOL_KEY) || "null");
+  if (c && !DEBUG) coolUntil = performance.now() + Math.max(0, (+c.until || 0) - Date.now());
+} catch (e) {}
+const cooling = () => performance.now() < coolUntil;
+function startCooldown() {
+  coolN++;
+  if (!(cfg.COOLDOWN_S > 0)) return;
+  coolUntil = performance.now() + cfg.COOLDOWN_S * 1000;
+  candF = null;
+  if (!DEBUG) store.set(COOL_KEY, JSON.stringify({ until: Date.now() + cfg.COOLDOWN_S * 1000 }));
+}
+
 function handle(now, voiced, mf) {
   if (phase !== "idle" || !steps.length) return;
+  if (cooling()) { candF = null; lastVoiced = now; return; }
   if (voiced) {
     lastVoiced = now; unvoicedSince = 0;
     let d = candF === null ? null : mf - candF;
     if (d !== null && !exactOctave()) d -= 12 * Math.round(d / 12);   // a detector octave slip stays the same note
-    if (d === null || Math.abs(d) > 0.7) { candF = mf; candSince = now; done = false; samples = [mf]; }
-    else { samples.push(candF + d); if (samples.length > 90) samples.shift(); candF = median(samples); }
+    if (d === null || Math.abs(d) > 0.6) {
+      candF = mf; candSince = now; done = false; candWrong = false; candStruck = false; samples = [mf];
+    } else { samples.push(candF + d); if (samples.length > 90) samples.shift(); candF = median(samples); }
     const held = now - candSince;
-    if (!done && held >= cfg.HOLD_MS) judge(candF, held);
+    if (held >= cfg.HOLD_MS) {
+      if (!done) judge(candF);
+      // a wrong note held this long is a mistake no matter what follows
+      if (candWrong && !done && !candStruck && held >= cfg.WRONG_HOLD_MS) { candStruck = true; strike(); }
+    }
   } else {
     if (!unvoicedSince) unvoicedSince = now;
-    if (now - unvoicedSince > 100) candF = null;
-    if (step > 0 && now - lastVoiced > cfg.SILENCE_RESET_MS) { if (progressed()) miss = 1; step = 0; }
+    if (pending && now - unvoicedSince > 150) strike();   // stopped on a wrong note
+    if (now - unvoicedSince > 250) candF = null;          // short dropouts (breaths, weak frames) keep the note going
+    if (step > 0 && now - lastVoiced > cfg.SILENCE_RESET_MS) {
+      if (progressed()) miss = 1;
+      if (strikes > 0) startCooldown();        // stopping after mistakes can't dodge the cooldown
+      newAttempt();
+    }
   }
 }
-// nf = the held note's measured pitch (fractional MIDI number)
-function judge(nf, held) {
+// What the held pitch nf (fractional MIDI number) is: "start", "hit", "same" (the last good note again) or "wrong".
+function classify(nf) {
   if (cfg.MATCH !== "intervals") {
     const pc = mod12(Math.round(nf));
-    if (step < steps.length && pc === steps[step].pc) accept(nf);
-    else if (step > 0 && pc === steps[step - 1].pc) done = true;            // still on the last good note
-    else if (cfg.WRONG_RESETS && held >= cfg.WRONG_HOLD_MS) {
-      if (progressed()) miss = 1;
-      step = pc === steps[0].pc ? 1 : 0; done = true;
-    }
-    return;
+    if (pc === steps[step].pc) return step === 0 ? "start" : "hit";
+    if (step > 0 && pc === steps[step - 1].pc) return "same";
+    return "wrong";
   }
-  if (step === 0) { lastIv = null; accept(nf); return; }                   // any note can start it
-  const iv = Math.round(nf - lastF), want = steps[step].midi - steps[step - 1].midi;
+  if (step === 0) return "start";                                         // any note can start it
+  // keyEst = how far their key sits from the written melody, averaged over the notes matched so far.
+  // Judging each note against that (instead of only the previous note) keeps one flat note
+  // from making the next jump look wrong.
+  const wrap = v => v - 12 * Math.round(v / 12);                          // octave ignored: fold into -6..+6
   const oct = cfg.OCTAVE_MATTERS;
-  if (oct ? iv === want : mod12(iv) === mod12(want)) { lastIv = iv; accept(nf); }
-  else if (oct ? iv === 0 : mod12(iv) === 0) { lastF = nf; done = true; }   // same note again
-  else if (cfg.WRONG_RESETS && held >= cfg.WRONG_HOLD_MS) {
-    if (progressed()) miss = 1;
-    lastIv = iv; step = 1; lastF = nf; done = true;                       // the wrong note starts a new attempt
+  const same = Math.abs(oct ? nf - lastF : wrap(nf - lastF)) < 0.5;
+  const off = nf - steps[step].midi - keyEst;
+  lastErr = oct ? off : wrap(off);
+  if (!same && Math.abs(lastErr) <= cfg.INTERVAL_TOLERANCE) return "hit";
+  return same ? "same" : "wrong";
+}
+function judge(nf) {
+  const c = classify(nf);
+  if (c === "wrong") {
+    if (!candWrong) {                // first moment this note looks wrong
+      candWrong = true;
+      if (pending) strike();         // the previous wrong note went into another wrong one
+      if (step > 0) pending = true;
+    }
+    return;                          // keep listening: it may still settle onto the right pitch
+  }
+  done = true;
+  if (c === "start") {
+    keyEst = nf - steps[0].midi; keyN = 1; lastErr = null; strikes = 0; pending = false;
+    accept(nf);
+  } else if (c === "hit") {
+    pending = false;                 // slid straight from a wrong note into the right one: forgiven
+    if (cfg.MATCH === "intervals") { keyN++; keyEst += lastErr * Math.max(1 / keyN, 0.35); }   // recent notes count most
+    accept(nf);
+  } else {
+    lastF = nf;                      // the last good note again: harmless
   }
 }
 function accept(nf) { lastF = nf; done = true; advance(); }
@@ -535,14 +608,15 @@ function draw(now) {
     }
     const ph = t % loopLen, B = CONFIG.BEAT_SECONDS;
     const rate = (dt * 8) / Math.max(1, notes.length / 7);
+    const quiet = phase === "idle" && cooling() ? 0.3 : 1;     // stars go dim and the hint pauses during a cooldown
     for (const n of notes) {
       const lk = n.step < step;
-      const hint = nt < 0 && ph >= n.start * B && ph < (n.start + n.beats * 0.85) * B;
+      const hint = nt < 0 && quiet === 1 && ph >= n.start * B && ph < (n.start + n.beats * 0.85) * B;
       if (lk) { glow(n.x, n.y, 24 * u, "255,200,120", 0.55 * fa); glow(n.x, n.y, 6 * u, "255,240,210", fa); }
       else if (hint) { glow(n.x, n.y, 18 * u, "190,210,255", 0.6); glow(n.x, n.y, 5 * u, "240,245,255", 1); }
       else {
-        glow(n.x, n.y, 10 * u, miss > 0 ? "255,90,90" : "150,170,255", 0.25 + miss * 0.5);
-        glow(n.x, n.y, 3 * u, "200,210,255", 0.7);
+        glow(n.x, n.y, 10 * u, miss > 0 ? "255,90,90" : "150,170,255", (0.25 + miss * 0.5) * quiet);
+        glow(n.x, n.y, 3 * u, "200,210,255", 0.7 * quiet);
       }
       if (lk && nt < S1 && R() < rate) parts.push({ n, k: 0, o: (R() - 0.5) * 80 * u });
     }
@@ -650,8 +724,11 @@ function buildDebug() {
   const sliders = [
     ["MIN_DB", "Min level (dB)", -80, -20, 1],
     ["CLARITY", "Clarity", 0.5, 0.98, 0.01],
+    ["INTERVAL_TOLERANCE", "Jump tolerance (semitones)", 0.3, 1.5, 0.05],
     ["HOLD_MS", "Hold to count (ms)", 40, 500, 10],
-    ["WRONG_HOLD_MS", "Wrong-note hold (ms)", 150, 2000, 50],
+    ["MISTAKES_ALLOWED", "Mistakes allowed per attempt", 0, 6, 1],
+    ["WRONG_HOLD_MS", "Wrong note held this long = mistake (ms)", 150, 2000, 50],
+    ["COOLDOWN_S", "Cooldown after a failed attempt (s)", 0, 30, 1],
     ["SILENCE_RESET_MS", "Silence reset (ms)", 1000, 8000, 250]
   ];
   for (const [key, label, mn, mx, st] of sliders) {
@@ -672,8 +749,7 @@ function buildDebug() {
     l.append(cb, " " + label);
     el.append(l);
   };
-  const rematch = () => { buildSteps(); step = 0; candF = null; lastIv = null; renderSim(); };
-  check("Held wrong notes reset", "WRONG_RESETS");
+  const rematch = () => { buildSteps(); newAttempt(); candF = null; lastErr = null; renderSim(); };
   check("Match intervals (any key)", "MATCH", rematch);
   check("Octave matters (intervals only)", "OCTAVE_MATTERS", rematch);
 
@@ -697,9 +773,10 @@ function buildDebug() {
   btn(row, "Reset", resetAll);
   btn(row, "Copy settings", () => {
     const s = JSON.stringify({
-      MATCH: cfg.MATCH, OCTAVE_MATTERS: cfg.OCTAVE_MATTERS,
+      MATCH: cfg.MATCH, OCTAVE_MATTERS: cfg.OCTAVE_MATTERS, INTERVAL_TOLERANCE: cfg.INTERVAL_TOLERANCE,
       MIN_DB: cfg.MIN_DB, CLARITY: cfg.CLARITY, HOLD_MS: cfg.HOLD_MS,
-      WRONG_RESETS: cfg.WRONG_RESETS, WRONG_HOLD_MS: cfg.WRONG_HOLD_MS, SILENCE_RESET_MS: cfg.SILENCE_RESET_MS
+      MISTAKES_ALLOWED: cfg.MISTAKES_ALLOWED, WRONG_HOLD_MS: cfg.WRONG_HOLD_MS, SILENCE_RESET_MS: cfg.SILENCE_RESET_MS,
+      COOLDOWN_S: cfg.COOLDOWN_S
     });
     try { navigator.clipboard.writeText(s); } catch (e) {}
     msg(s);
@@ -802,8 +879,8 @@ function bakeSource(src, s) {
   set(/\bREVEAL_TEXT: "(?:[^"\\]|\\.)*",/, `REVEAL_TEXT: ${JSON.stringify(s.REVEAL_TEXT || "").replace(/</g, "\\u003c")},`);
   set(/\bMATCH: "[a-z]+",/, `MATCH: ${JSON.stringify(s.MATCH === "absolute" ? "absolute" : "intervals")},`);
   set(/\bOCTAVE_MATTERS: (true|false),/, `OCTAVE_MATTERS: ${!!s.OCTAVE_MATTERS},`);
-  set(/\bWRONG_RESETS: (true|false),/, `WRONG_RESETS: ${!!s.WRONG_RESETS},`);
-  for (const k of ["MIN_DB", "CLARITY", "HOLD_MS", "WRONG_HOLD_MS", "SILENCE_RESET_MS"]) {
+  for (const k of ["INTERVAL_TOLERANCE", "MIN_DB", "CLARITY", "HOLD_MS", "MISTAKES_ALLOWED", "WRONG_HOLD_MS",
+                   "COOLDOWN_S", "SILENCE_RESET_MS"]) {
     if (!Number.isFinite(+s[k])) throw new Error("Bad value for " + k);
     set(new RegExp("\\b" + k + ": -?[\\d.]+,"), `${k}: ${+s[k]},`);
   }
@@ -811,30 +888,23 @@ function bakeSource(src, s) {
 }
 // A note that is neither the next correct note nor a repeat of the last one.
 function wrongNote() {
-  const base = cfg.MATCH === "intervals" && step > 0 ? Math.round(lastF) : 60;
-  for (let k = 1; k < 12; k++) {
-    const m = base + k;
-    if (cfg.MATCH === "intervals") {
-      if (step === 0) return m;
-      const want = steps[step].midi - steps[step - 1].midi;
-      if (mod12(k) !== mod12(want)) return m;
-    } else {
-      const pc = mod12(m);
-      if (pc !== steps[0].pc && (!steps[step] || pc !== steps[step].pc) && (step === 0 || pc !== steps[step - 1].pc)) return m;
-    }
-  }
-  return base + 1;
+  const base = step > 0 ? Math.round(lastF) : 60;
+  for (let k = 1; k < 12; k++) if (classify(base + k) === "wrong") return base + k;
+  return base + 6;
 }
+// A fake note, as if sung on its own and followed by a pause.
 function simNote(midi) {
   ensureAudio();
   if (phase !== "idle" || !steps.length) return;
-  done = false;
-  judge(midi, Infinity);
+  done = false; candWrong = false; candStruck = false;
+  judge(midi);
+  if (candWrong && !done) { candStruck = true; strike(); }
   lastVoiced = performance.now();
 }
 function resetAll() {
   phase = "idle"; step = 0; ins = 0; wT = -1; miss = 0; parts = []; deb = [];
-  candF = null; samples = []; lastIv = null;
+  candF = null; samples = []; lastErr = null; strikes = 0; pending = false; candWrong = false;
+  coolN = 0; coolUntil = 0; store.del(COOL_KEY);
   revealed = false;
   revealEl.classList.remove("show"); revealEl.style.transition = "";
   ui.style.opacity = 1;
@@ -842,6 +912,7 @@ function resetAll() {
   msg(CONFIG.INSTRUCTION);
   if (!running) { running = true; lastT = performance.now(); requestAnimationFrame(frame); }
 }
+const sgn = (v, digits = 1) => (v > 0 ? "+" : "") + v.toFixed(digits);
 function updDebug() {
   if (!dRead) return;
   const L = live;
@@ -854,10 +925,12 @@ function updDebug() {
     `mic: ${listening ? "on" : "off"} · phase: ${phase}<br>` +
     `pitch: ${L.freq ? L.freq.toFixed(1) + " Hz" : "—"} · ${note}<br>` +
     `clarity: ${L.clar.toFixed(2)} · level: ${L.db.toFixed(0)} dB<br>` +
-    `counts: ${L.voiced ? "YES" : "no"} · step: ${step}/${steps.length}<br>` +
+    `counts: ${L.voiced ? "YES" : "no"} · step: ${step}/${steps.length} · mistakes: ${strikes}/${cfg.MISTAKES_ALLOWED}<br>` +
+    `cooldown: ${cooling() ? Math.ceil((coolUntil - performance.now()) / 1000) + "s left" : "none"} · failed attempts: ${coolN}<br>` +
     `match: ${cfg.MATCH}` +
     (cfg.MATCH === "intervals"
-      ? ` (${cfg.OCTAVE_MATTERS ? "octave matters" : "any octave"}) · last jump: ${lastIv === null ? "—" : (lastIv > 0 ? "+" : "") + lastIv}`
+      ? ` (${cfg.OCTAVE_MATTERS ? "octave matters" : "any octave"})<br>` +
+        `last note: ${lastErr === null ? "—" : `off by ${sgn(lastErr, 2)} semitones (counts within ±${cfg.INTERVAL_TOLERANCE})`}`
       : "");
 }
 
