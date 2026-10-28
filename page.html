@@ -1,0 +1,885 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
+<meta name="theme-color" content="#04050b">
+<title>Listen</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body {
+    height: 100%; background: #04050b; color: #e8ecff; overflow: hidden;
+    font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    touch-action: manipulation; -webkit-user-select: none; user-select: none;
+  }
+  canvas { position: fixed; inset: 0; width: 100vw; height: 100vh; height: 100dvh; display: block; }
+  #ui {
+    position: fixed; left: 0; right: 0; bottom: max(28px, env(safe-area-inset-bottom));
+    display: flex; flex-direction: column; align-items: center; gap: 12px;
+    pointer-events: none; transition: opacity .8s;
+  }
+  #begin {
+    pointer-events: auto; font: inherit; font-size: 17px; letter-spacing: .08em; color: #e8ecff;
+    background: rgba(255,255,255,.06); border: 1px solid rgba(255,255,255,.25);
+    border-radius: 999px; padding: 12px 32px; cursor: pointer;
+  }
+  #begin:disabled { opacity: .5; }
+  #msg { font-size: 14px; color: #8a93b8; text-align: center; max-width: 340px; padding: 0 16px; min-height: 1.2em; }
+  #hear { font-size: 15px; letter-spacing: .25em; color: #b7c0e8; height: 1.2em; opacity: 0; transition: opacity .25s; }
+  #reveal {
+    position: fixed; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center;
+    gap: 18px; padding: 24px; text-align: center; background: #fff; color: #141c3a;
+    opacity: 0; pointer-events: none; transition: opacity 1.2s;
+  }
+  #reveal.show { opacity: 1; pointer-events: auto; }
+  #coords {
+    font: 500 clamp(20px, 6vw, 34px) ui-monospace, SFMono-Regular, Menlo, monospace;
+    -webkit-user-select: text; user-select: text;
+  }
+  #revealText { font-size: 16px; color: #4a5378; max-width: 420px; }
+  #mapLink { font-size: 16px; color: #1d3fbf; text-decoration: none; border: 1px solid #c8d0ee; border-radius: 999px; padding: 10px 22px; }
+  #dbg {
+    position: fixed; top: 8px; left: 8px; z-index: 10; display: none;
+    width: min(300px, calc(100vw - 16px)); max-height: calc(100dvh - 16px); overflow: auto;
+    background: rgba(10,12,24,.9); border: 1px solid rgba(255,255,255,.15); border-radius: 10px; padding: 10px;
+    font: 12px/1.5 ui-monospace, Menlo, monospace; color: #cfd6ff;
+  }
+  #dbg label { display: block; margin-top: 6px; }
+  #dbg input[type=range] { width: 100%; }
+  #dbg button {
+    font: inherit; color: #cfd6ff; background: rgba(255,255,255,.08); border: 1px solid rgba(255,255,255,.2);
+    border-radius: 6px; padding: 4px 8px; margin: 4px 4px 0 0; cursor: pointer;
+  }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="ui">
+  <div id="hear"></div>
+  <div id="msg"></div>
+  <button id="begin" type="button">Begin</button>
+</div>
+<div id="reveal">
+  <div id="coords"></div>
+  <div id="revealText"></div>
+  <a id="mapLink" target="_blank" rel="noopener">Open in Maps</a>
+</div>
+<div id="dbg"></div>
+
+<script>
+"use strict";
+// Untouched copy of this page, used by the setup box's "Download page" button.
+const PAGE_SRC = "<!doctype html>\n" + document.documentElement.outerHTML;
+
+/* =====================================================================
+   CONFIG — edit this block
+   ===================================================================== */
+const CONFIG = {
+  // The melody, as [note, beats]. Note names like "C4", "F#3", "Bb4".
+  // Rhythm is never checked. Octave and beats shape the star hint
+  // (height = pitch, spacing and flash length = rhythm).
+  // Back-to-back repeats of the same note only need to be played once.
+  // THIS IS A TEST SCALE. Replace it with your melody.
+  SEQUENCE: [["C4", 1], ["D4", 1], ["E4", 1], ["G4", 2]],
+  BEAT_SECONDS: 0.5,          // tempo of the star hint
+  HINT_GAP_SECONDS: 2,        // pause before the hint repeats
+
+  COORDS: { lat: 0.00000, lng: 0.00000 },   // decimal degrees; west longitude is negative
+  REVEAL_TEXT: "",            // optional line under the coordinates
+  INSTRUCTION: "Listen to the stars. Answer them.",
+
+  // Matching.
+  //  "intervals": any starting note works; only the jumps between notes are
+  //               checked, so the melody can be played in any key.
+  //  "absolute":  the exact note names in SEQUENCE are required (octave ignored).
+  MATCH: "intervals",
+  OCTAVE_MATTERS: false,      // intervals only: if true, jumps must go the right
+                              // direction and size (up 5 is not down 7)
+
+  // Detection. Tune these at the real spot with ?debug on the URL.
+  MIN_DB: -50,                // sounds quieter than this are ignored
+  CLARITY: 0.8,               // 0-1, how cleanly pitched a sound must be
+  HOLD_MS: 140,               // a note must be steady this long to count
+  WRONG_RESETS: true,         // does a held wrong note reset progress?
+  WRONG_HOLD_MS: 400,         // ...only if it's held at least this long
+  SILENCE_RESET_MS: 3000,     // a pause longer than this resets progress
+  MIN_HZ: 70,
+  MAX_HZ: 1200
+};
+/* ===================================================================== */
+
+const params = new URLSearchParams(location.search);
+const DEBUG = params.has("debug");
+const SOLVED_KEY = "supernova-solved-" + (params.get("s") || "default").slice(0, 64);
+const S1 = 2.0, S2 = 3.4, S3 = 3.9, TW = 3.65, ARM_MS = 600;   // supernova timeline (seconds)
+const NAMES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];
+const BASE = { C: 0, D: 2, E: 4, F: 5, G: 7, A: 9, B: 11 };
+
+/* ---------- setup carried in the link (?s=...) ---------- */
+// The setup box in ?debug mode packs melody, coordinates and reveal text into
+// the link, so the file never has to be edited by hand.
+const b64e = s => {
+  let t = "";
+  for (const x of new TextEncoder().encode(s)) t += String.fromCharCode(x);
+  return btoa(t).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+};
+const b64d = s => {
+  const t = atob(s.replace(/-/g, "+").replace(/_/g, "/"));
+  return new TextDecoder().decode(Uint8Array.from(t, c => c.charCodeAt(0)));
+};
+// "C4 G4:2 Bb" -> [["C4",1],["G4",2],["Bb4",1]]. ":n" sets beats (default 1).
+// A note written without an octave takes the octave closest to the note before it.
+function parseMelody(text) {
+  const out = [];
+  let prev = null;
+  for (const tok of String(text).trim().split(/[\s,]+/).filter(Boolean)) {
+    const m = /^([A-Ga-g])([#b]?)(-?\d)?(?::(\d*\.?\d+))?$/.exec(tok);
+    if (!m) throw new Error("Can't read note: " + tok);
+    const name = m[1].toUpperCase() + m[2];
+    let oct = m[3] !== undefined ? +m[3] : 4;
+    if (m[3] === undefined && prev !== null) {
+      const po = Math.floor(prev / 12) - 1;
+      let best = Infinity;
+      for (const o of [po - 1, po, po + 1]) {
+        const dist = Math.abs(toMidi(name + o) - prev);
+        if (dist < best) { best = dist; oct = o; }
+      }
+    }
+    prev = toMidi(name + oct);
+    out.push([name + oct, m[4] ? +m[4] : 1]);
+  }
+  if (!out.length) throw new Error("The melody is empty.");
+  return out;
+}
+let setupError = "";
+if (params.has("s")) {
+  try {
+    const s = JSON.parse(b64d(params.get("s")));
+    if (s.m) CONFIG.SEQUENCE = parseMelody(s.m);
+    if (typeof s.lat === "number" && typeof s.lng === "number") CONFIG.COORDS = { lat: s.lat, lng: s.lng };
+    if (typeof s.t === "string") CONFIG.REVEAL_TEXT = s.t;
+  } catch (err) {
+    setupError = "This link's setup is broken: " + err.message;
+  }
+}
+
+const cfg = Object.assign({}, CONFIG);
+const R = Math.random;
+const cl = (v, a, b) => Math.max(a, Math.min(b, v));
+const eio = k => (k < 0.5 ? 2 * k * k : 1 - Math.pow(-2 * k + 2, 2) / 2);
+
+const store = {
+  get(k) { try { return localStorage.getItem(k); } catch (e) { return null; } },
+  set(k, v) { try { localStorage.setItem(k, v); } catch (e) {} },
+  del(k) { try { localStorage.removeItem(k); } catch (e) {} }
+};
+if (params.has("reset")) store.del(SOLVED_KEY);
+
+const cv = document.getElementById("c"), ctx = cv.getContext("2d");
+const ui = document.getElementById("ui"), msgEl = document.getElementById("msg");
+const beginBtn = document.getElementById("begin"), hearEl = document.getElementById("hear");
+const revealEl = document.getElementById("reveal");
+function msg(s) { msgEl.textContent = s || ""; }
+
+/* ---------- melody ---------- */
+function toMidi(s) {
+  const m = /^([A-Ga-g])([#b]?)(-?\d)$/.exec(String(s).trim());
+  if (!m) throw new Error("Bad note name in SEQUENCE: " + s);
+  return 12 * (+m[3] + 1) + BASE[m[1].toUpperCase()] + (m[2] === "#" ? 1 : m[2] === "b" ? -1 : 0);
+}
+const mod12 = v => ((v % 12) + 12) % 12;
+const exactOctave = () => cfg.MATCH === "intervals" && cfg.OCTAVE_MATTERS;
+const notes = [];   // one star per note in SEQUENCE
+const steps = [];   // what they have to play (back-to-back repeats merged)
+let totalBeats = 0, configError = "";
+try {
+  for (const [name, beats] of CONFIG.SEQUENCE) {
+    const midi = toMidi(name);
+    notes.push({ midi, pc: mod12(midi), beats: +beats || 1, start: totalBeats, step: 0, x: 0, y: 0 });
+    totalBeats += +beats || 1;
+  }
+  if (!notes.length) configError = "SEQUENCE is empty. Add notes in CONFIG.";
+} catch (err) {
+  configError = err.message; notes.length = 0;
+}
+function buildSteps() {
+  // Same-name notes in a row merge, unless octave matters (then an octave jump is a real step).
+  steps.length = 0;
+  for (const n of notes) {
+    const prev = steps[steps.length - 1];
+    if (!prev || (exactOctave() ? prev.midi !== n.midi : prev.pc !== n.pc)) steps.push({ pc: n.pc, midi: n.midi });
+    n.step = steps.length - 1;
+  }
+}
+buildSteps();
+const loopLen = Math.max(0.1, totalBeats * CONFIG.BEAT_SECONDS + CONFIG.HINT_GAP_SECONDS);
+
+/* ---------- layout ---------- */
+let W = 0, H = 0, u = 1, SX = 0, SY = 0, DIAG = 1, bg = [];
+function layout() {
+  const d = Math.min(2, window.devicePixelRatio || 1);
+  W = window.innerWidth; H = window.innerHeight;
+  cv.width = Math.round(W * d); cv.height = Math.round(H * d);
+  ctx.setTransform(d, 0, 0, d, 0, 0);
+  u = cl(Math.min(W / 500, H / 450), 0.7, 1.6);
+  SX = W / 2; SY = H * 0.2;
+  DIAG = Math.max(Math.hypot(SX, SY), Math.hypot(W - SX, SY), Math.hypot(SX, H - SY), Math.hypot(W - SX, H - SY));
+  const count = Math.min(420, Math.round((W * H) / 2200));
+  bg = Array.from({ length: count }, () => ({ x: R(), y: R(), r: R() * 1.2 + 0.3, p: R() * 6.3, s: R() * 1.5 + 0.3, z: R() }));
+  const x0 = W * 0.1, x1 = W * 0.9, yTop = H * 0.56, yBot = H * 0.86;
+  const lastStart = notes.length ? notes[notes.length - 1].start : 0;
+  let lo = Infinity, hi = -Infinity;
+  for (const n of notes) { lo = Math.min(lo, n.midi); hi = Math.max(hi, n.midi); }
+  for (const n of notes) {
+    n.x = lastStart > 0 ? x0 + (n.start / lastStart) * (x1 - x0) : W / 2;
+    n.y = hi > lo ? yBot - ((n.midi - lo) / (hi - lo)) * (yBot - yTop) : (yTop + yBot) / 2;
+  }
+}
+window.addEventListener("resize", layout);
+layout();
+
+function glow(x, y, r, col, a) {
+  if (r <= 0 || a <= 0) return;
+  const g = ctx.createRadialGradient(x, y, 0, x, y, r);
+  g.addColorStop(0, `rgba(${col},${a})`);
+  g.addColorStop(1, `rgba(${col},0)`);
+  ctx.fillStyle = g; ctx.beginPath(); ctx.arc(x, y, r, 0, 6.2832); ctx.fill();
+}
+
+/* ---------- state ---------- */
+let phase = "idle", t0 = 0, wT = -1, ins = 0, miss = 0, step = 0;
+let parts = [], deb = [], revealed = false, running = true, lastT = performance.now();
+
+/* ---------- audio + mic ---------- */
+let ac = null, master = null, stream = null, analyser = null, buf = null, ds = null, nsdfBuf = null;
+let listening = false;
+let live = { db: -120, freq: 0, clar: 0, voiced: false, midiF: 0, pc: -1 };
+let candF = null, candSince = 0, done = false, samples = [], lastF = 0, lastIv = null;
+let lastVoiced = 0, unvoicedSince = 0, lastHeard = 0;
+
+function ensureAudio() {
+  if (!ac) {
+    const AC = window.AudioContext || window.webkitAudioContext;
+    if (!AC) return null;
+    ac = new AC();
+    master = ac.createDynamicsCompressor();
+    master.connect(ac.destination);
+  }
+  if (ac.state === "suspended") ac.resume();
+  return ac;
+}
+
+async function begin() {
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+    msg("Open this page directly in Safari or Chrome, not inside another app.");
+    return;
+  }
+  ensureAudio();
+  beginBtn.disabled = true;
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({
+      audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false }
+    });
+  } catch (err) {
+    beginBtn.disabled = false;
+    msg(err && err.name === "NotAllowedError"
+      ? "This needs your microphone. Allow it, then reload the page."
+      : "Couldn't start the microphone. Reload and try again.");
+    return;
+  }
+  const src = ac.createMediaStreamSource(stream);
+  analyser = ac.createAnalyser();
+  analyser.fftSize = 2048;
+  src.connect(analyser);
+  buf = new Float32Array(analyser.fftSize);
+  ds = new Float32Array(analyser.fftSize / 2);
+  listening = true;
+  lastVoiced = performance.now();
+  beginBtn.style.display = "none";
+  beginBtn.disabled = false;
+  msg(CONFIG.INSTRUCTION);
+  requestWake();
+}
+beginBtn.addEventListener("click", begin);
+
+function stopMic() {
+  listening = false;
+  if (stream) { stream.getTracks().forEach(t => t.stop()); stream = null; }
+  hearEl.style.opacity = 0;
+}
+
+let wake = null;
+async function requestWake() {
+  try { if ("wakeLock" in navigator) wake = await navigator.wakeLock.request("screen"); } catch (e) {}
+}
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "visible") {
+    if (ac && ac.state === "suspended") ac.resume();
+    if (listening || phase !== "idle") requestWake();
+  }
+});
+
+/* ---------- pitch detection (McLeod pitch method) ---------- */
+function mpm(x, sr, minF, maxF) {
+  const n = x.length;
+  const tMin = Math.max(2, Math.floor(sr / maxF));
+  const tMax = Math.min(Math.floor(n / 2) - 2, Math.ceil(sr / minF));
+  const L = tMax + 2;
+  if (!nsdfBuf || nsdfBuf.length < L) nsdfBuf = new Float32Array(L);
+  const ns = nsdfBuf;
+  let m = 0;
+  for (let i = 0; i < n; i++) m += 2 * x[i] * x[i];
+  for (let tau = 0; tau < L; tau++) {
+    if (tau > 0) m -= x[n - tau] * x[n - tau] + x[tau - 1] * x[tau - 1];
+    let acf = 0;
+    const lim = n - tau;
+    for (let i = 0; i < lim; i++) acf += x[i] * x[i + tau];
+    ns[tau] = m > 1e-12 ? (2 * acf) / m : 0;
+  }
+  let i = 1;
+  while (i < L && ns[i] > 0) i++;
+  const peaks = [];
+  let best = -1;
+  while (i < L) {
+    while (i < L && ns[i] <= 0) i++;
+    let pv = -1, pi = -1;
+    while (i < L && ns[i] > 0) { if (ns[i] > pv) { pv = ns[i]; pi = i; } i++; }
+    if (pi > 0) { peaks.push(pi); if (pv > best) best = pv; }
+  }
+  if (!peaks.length) return [0, 0];
+  let k = -1;
+  for (const p of peaks) if (p >= tMin && ns[p] >= 0.9 * best) { k = p; break; }
+  if (k < 1 || k >= L - 1) return [0, 0];
+  const a = ns[k - 1], b = ns[k], c = ns[k + 1], den = a - 2 * b + c;
+  const d = den !== 0 ? (0.5 * (a - c)) / den : 0;
+  return [sr / (k + d), Math.min(1, b - 0.25 * (a - c) * d)];
+}
+
+function detect(now) {
+  analyser.getFloatTimeDomainData(buf);
+  const h = ds.length;
+  let mean = 0, sum = 0;
+  for (let i = 0; i < h; i++) { const v = (buf[2 * i] + buf[2 * i + 1]) * 0.5; ds[i] = v; mean += v; }
+  mean /= h;
+  for (let i = 0; i < h; i++) { ds[i] -= mean; sum += ds[i] * ds[i]; }
+  const db = 20 * Math.log10(Math.sqrt(sum / h) + 1e-9);
+  let freq = 0, clar = 0;
+  if (db >= cfg.MIN_DB) [freq, clar] = mpm(ds, ac.sampleRate / 2, cfg.MIN_HZ, cfg.MAX_HZ);
+  const voiced = db >= cfg.MIN_DB && clar >= cfg.CLARITY && freq >= cfg.MIN_HZ && freq <= cfg.MAX_HZ;
+  const midiF = freq > 0 ? 69 + 12 * Math.log2(freq / 440) : 0;
+  const pc = voiced ? ((Math.round(midiF) % 12) + 12) % 12 : -1;
+  live = { db, freq, clar, voiced, midiF, pc };
+  handle(now, voiced, midiF);
+}
+
+/* ---------- note logic ---------- */
+// In interval mode the first note is free, so a reset only "counts" once a real jump was matched.
+const progressed = () => step >= (cfg.MATCH === "intervals" ? 2 : 1);
+function median(a) {
+  const s = a.slice().sort((x, y) => x - y), m = s.length >> 1;
+  return s.length % 2 ? s[m] : (s[m - 1] + s[m]) / 2;
+}
+function handle(now, voiced, mf) {
+  if (phase !== "idle" || !steps.length) return;
+  if (voiced) {
+    lastVoiced = now; unvoicedSince = 0;
+    let d = candF === null ? null : mf - candF;
+    if (d !== null && !exactOctave()) d -= 12 * Math.round(d / 12);   // a detector octave slip stays the same note
+    if (d === null || Math.abs(d) > 0.7) { candF = mf; candSince = now; done = false; samples = [mf]; }
+    else { samples.push(candF + d); if (samples.length > 90) samples.shift(); candF = median(samples); }
+    const held = now - candSince;
+    if (!done && held >= cfg.HOLD_MS) judge(candF, held);
+  } else {
+    if (!unvoicedSince) unvoicedSince = now;
+    if (now - unvoicedSince > 100) candF = null;
+    if (step > 0 && now - lastVoiced > cfg.SILENCE_RESET_MS) { if (progressed()) miss = 1; step = 0; }
+  }
+}
+// nf = the held note's measured pitch (fractional MIDI number)
+function judge(nf, held) {
+  if (cfg.MATCH !== "intervals") {
+    const pc = mod12(Math.round(nf));
+    if (step < steps.length && pc === steps[step].pc) accept(nf);
+    else if (step > 0 && pc === steps[step - 1].pc) done = true;            // still on the last good note
+    else if (cfg.WRONG_RESETS && held >= cfg.WRONG_HOLD_MS) {
+      if (progressed()) miss = 1;
+      step = pc === steps[0].pc ? 1 : 0; done = true;
+    }
+    return;
+  }
+  if (step === 0) { lastIv = null; accept(nf); return; }                   // any note can start it
+  const iv = Math.round(nf - lastF), want = steps[step].midi - steps[step - 1].midi;
+  const oct = cfg.OCTAVE_MATTERS;
+  if (oct ? iv === want : mod12(iv) === mod12(want)) { lastIv = iv; accept(nf); }
+  else if (oct ? iv === 0 : mod12(iv) === 0) { lastF = nf; done = true; }   // same note again
+  else if (cfg.WRONG_RESETS && held >= cfg.WRONG_HOLD_MS) {
+    if (progressed()) miss = 1;
+    lastIv = iv; step = 1; lastF = nf; done = true;                       // the wrong note starts a new attempt
+  }
+}
+function accept(nf) { lastF = nf; done = true; advance(); }
+function advance() {
+  step++;
+  if (step >= steps.length) solve();
+}
+function solve() {
+  if (phase !== "idle") return;
+  step = steps.length;
+  stopMic();
+  msg("");
+  phase = "armed";
+  t0 = performance.now() + ARM_MS;
+}
+
+/* ---------- supernova ---------- */
+function waveR(e) { return 10 * u + DIAG * (0.3 * (1 - Math.exp(-e * 5)) + 0.75 * Math.pow(e / TW, 1.6)); }
+function waveTime() { for (let e = 0; e < 10; e += 0.01) if (waveR(e) >= DIAG) return e; return 4; }
+
+function startNova(now) {
+  phase = "nova"; t0 = now; deb = []; wT = -1;
+  novaAudio();
+  setTimeout(() => { try { if (navigator.vibrate) navigator.vibrate([250, 80, 600]); } catch (e) {} }, S3 * 1000);
+}
+
+function noise() {
+  const b = ac.createBuffer(1, ac.sampleRate * 2, ac.sampleRate), d = b.getChannelData(0);
+  for (let i = 0; i < d.length; i++) d[i] = Math.random() * 2 - 1;
+  const s = ac.createBufferSource(); s.buffer = b; s.loop = true;
+  return s;
+}
+function novaAudio() {
+  if (!ac) return;
+  if (ac.state === "suspended") ac.resume();
+  const T = ac.currentTime + 0.02;
+  {   // rumble while the sun swells and collapses
+    const n = noise(), f = ac.createBiquadFilter(), g = ac.createGain();
+    f.type = "lowpass";
+    f.frequency.setValueAtTime(60, T); f.frequency.linearRampToValueAtTime(200, T + S1);
+    g.gain.setValueAtTime(0.0001, T); g.gain.exponentialRampToValueAtTime(0.7, T + S1);
+    g.gain.exponentialRampToValueAtTime(0.0001, T + S2);
+    n.connect(f); f.connect(g); g.connect(master); n.start(T); n.stop(T + S2 + 0.1);
+  }
+  const B = T + S3;
+  {   // the burst
+    const n = noise(), f = ac.createBiquadFilter(), g = ac.createGain();
+    f.type = "lowpass";
+    f.frequency.setValueAtTime(4000, B); f.frequency.exponentialRampToValueAtTime(80, B + 2.5);
+    g.gain.setValueAtTime(0.0001, B); g.gain.exponentialRampToValueAtTime(1, B + 0.02);
+    g.gain.exponentialRampToValueAtTime(0.0001, B + 3);
+    n.connect(f); f.connect(g); g.connect(master); n.start(B); n.stop(B + 3.1);
+    const o = ac.createOscillator(), og = ac.createGain();
+    o.type = "sine";
+    o.frequency.setValueAtTime(110, B); o.frequency.exponentialRampToValueAtTime(28, B + 2);
+    og.gain.setValueAtTime(0.0001, B); og.gain.exponentialRampToValueAtTime(0.9, B + 0.03);
+    og.gain.exponentialRampToValueAtTime(0.0001, B + 2.5);
+    o.connect(og); og.connect(master); o.start(B); o.stop(B + 2.6);
+  }
+  {   // the wave closing in, cut dead at the whiteout
+    const W0 = B + 0.4, W1 = B + waveTime();
+    const n = noise(), f = ac.createBiquadFilter(), g = ac.createGain();
+    f.type = "bandpass"; f.Q.value = 0.7;
+    f.frequency.setValueAtTime(200, W0); f.frequency.exponentialRampToValueAtTime(3000, W1);
+    g.gain.setValueAtTime(0.0001, W0); g.gain.exponentialRampToValueAtTime(0.8, W1);
+    g.gain.setValueAtTime(0.0001, W1 + 0.03);
+    n.connect(f); f.connect(g); g.connect(master); n.start(W0); n.stop(W1 + 0.1);
+  }
+}
+
+/* ---------- drawing ---------- */
+function draw(now) {
+  const dt = Math.min(0.05, (now - lastT) / 1000); lastT = now;
+  const t = now / 1000;
+  if (phase === "armed" && now >= t0) startNova(now);
+  ins += ((steps.length ? step / steps.length : 0) - ins) * Math.min(1, dt * 3);
+  miss = Math.max(0, miss - dt * 1.5);
+  const nt = phase === "nova" ? (now - t0) / 1000 : -1;
+  const e = nt - S3, rad = e >= 0 ? waveR(e) : 0, f = cl(rad / DIAG, 0, 1);
+
+  let sh = ins * 1.5, sd = 1;
+  if (nt >= 0) {
+    if (nt < S1) { sh = 0.5 + (nt / S1) * 5; sd = 1 - 0.6 * (nt / S1); }
+    else if (nt < S2) { const k = (nt - S1) / (S2 - S1); sh = 5 * (1 - k); sd = 0.4 - 0.2 * k; }
+    else if (nt < S3) { sh = 0; sd = 0.2; }
+    else { sh = wT >= 0 ? 0 : (e < 0.4 ? 6 : 1.5) + f * 12; sd = 0.2; }
+  }
+  sh *= u;
+
+  ctx.save();
+  ctx.translate((R() - 0.5) * sh, (R() - 0.5) * sh);
+  ctx.globalCompositeOperation = "source-over";
+  ctx.fillStyle = "#04050b"; ctx.fillRect(-40, -40, W + 80, H + 80);
+  ctx.globalCompositeOperation = "lighter";
+
+  const M = Math.max(W, H);
+  glow(W * 0.2, H * 0.75, M * 0.35, "60,40,120", 0.12 * sd);
+  glow(W * 0.82, H * 0.5, M * 0.3, "20,80,110", 0.1 * sd);
+  for (const s of bg) {
+    const a = (0.25 + 0.6 * Math.abs(Math.sin(t * s.s + s.p))) * sd;
+    ctx.fillStyle = `rgba(215,225,255,${a})`;
+    ctx.fillRect((s.x * W + t * 3 * s.z) % W, s.y * H, s.r, s.r);
+  }
+
+  // note-stars: the hint, and progress
+  if (nt < S2 && notes.length) {
+    const fa = nt < S1 ? 1 : 1 - (nt - S1) / (S2 - S1);
+    ctx.lineWidth = 1; ctx.strokeStyle = `rgba(150,170,255,${0.12 * fa})`;
+    ctx.beginPath();
+    notes.forEach((n, i) => (i ? ctx.lineTo(n.x, n.y) : ctx.moveTo(n.x, n.y)));
+    ctx.stroke();
+    if (step > 0) {
+      ctx.lineWidth = 1.5; ctx.strokeStyle = `rgba(255,200,120,${0.35 * fa})`;
+      ctx.beginPath();
+      let first = true;
+      for (const n of notes) if (n.step < step) { if (first) ctx.moveTo(n.x, n.y); else ctx.lineTo(n.x, n.y); first = false; }
+      ctx.stroke();
+    }
+    const ph = t % loopLen, B = CONFIG.BEAT_SECONDS;
+    const rate = (dt * 8) / Math.max(1, notes.length / 7);
+    for (const n of notes) {
+      const lk = n.step < step;
+      const hint = nt < 0 && ph >= n.start * B && ph < (n.start + n.beats * 0.85) * B;
+      if (lk) { glow(n.x, n.y, 24 * u, "255,200,120", 0.55 * fa); glow(n.x, n.y, 6 * u, "255,240,210", fa); }
+      else if (hint) { glow(n.x, n.y, 18 * u, "190,210,255", 0.6); glow(n.x, n.y, 5 * u, "240,245,255", 1); }
+      else {
+        glow(n.x, n.y, 10 * u, miss > 0 ? "255,90,90" : "150,170,255", 0.25 + miss * 0.5);
+        glow(n.x, n.y, 3 * u, "200,210,255", 0.7);
+      }
+      if (lk && nt < S1 && R() < rate) parts.push({ n, k: 0, o: (R() - 0.5) * 80 * u });
+    }
+  }
+
+  // light streaming from locked stars into the sun
+  if (nt >= S1) parts = [];
+  parts = parts.filter(p => p.k < 1);
+  for (const p of parts) {
+    p.k += dt * 0.9;
+    const k = p.k, x0 = p.n.x, y0 = p.n.y;
+    const mx = (x0 + SX) / 2 + p.o, my = (y0 + SY) / 2;
+    const x = (1 - k) * (1 - k) * x0 + 2 * (1 - k) * k * mx + k * k * SX;
+    const y = (1 - k) * (1 - k) * y0 + 2 * (1 - k) * k * my + k * k * SY;
+    glow(x, y, 7 * u, "255,190,110", 0.5 * (1 - k * 0.5));
+  }
+
+  // the sun
+  let r = (36 + ins * 16) * u, warm = ins, show = true;
+  if (nt >= 0) {
+    if (nt < S1) { r = (52 + eio(nt / S1) * 80) * u; warm = 1; }
+    else if (nt < S2) { const k = (nt - S1) / (S2 - S1), k2 = k * k; r = (132 * (1 - k2) + 2 * k2) * u; warm = 1 - k; }
+    else show = false;
+  }
+  if (show) {
+    const col = `255,${Math.round(225 - warm * 120)},${Math.round(160 - warm * 100)}`;
+    glow(SX, SY, r * 3.4, col, 0.22 + warm * 0.15);
+    glow(SX, SY, r * 1.9, col, 0.5);
+    ctx.strokeStyle = `rgba(${col},${0.14 + warm * 0.1})`; ctx.lineWidth = 1;
+    ctx.beginPath();
+    for (let j = 0; j <= 96; j++) {
+      const a = (j / 96) * 6.2832;
+      const rr = r * 1.07 + ((Math.sin(a * 7 + t * 1.5) + Math.sin(a * 11 - t * 2)) * (0.7 + warm * 2.2) + (R() - 0.5) * warm * 1.2) * u;
+      const x = SX + Math.cos(a) * rr, y = SY + Math.sin(a) * rr;
+      if (j) ctx.lineTo(x, y); else ctx.moveTo(x, y);
+    }
+    ctx.stroke();
+    ctx.fillStyle = `rgba(${col},1)`;
+    ctx.beginPath(); ctx.arc(SX, SY, r, 0, 6.2832); ctx.fill();
+    glow(SX, SY, r * 0.85, "255,255,240", 0.9);
+  }
+  if (nt >= S2 && nt < S3) {   // the held pinpoint
+    glow(SX, SY, (5 + R() * 2.5) * u, "255,255,255", 0.95);
+    glow(SX, SY, 16 * u, "200,225,255", 0.25);
+  }
+
+  // the blue wave
+  if (e >= 0) {
+    if (!deb.length) for (let j = 0; j < 220; j++) deb.push({ a: R() * 6.2832, v: 0.55 + R() * 0.6 });
+    glow(SX, SY, (60 + e * 220) * u, "200,230,255", cl(1 - e / 0.7, 0, 1));
+    ctx.fillStyle = `rgba(40,90,220,${0.28 * f * f * f})`; ctx.fillRect(-40, -40, W + 80, H + 80);
+    const g = ctx.createRadialGradient(SX, SY, 0, SX, SY, rad);
+    g.addColorStop(0, `rgba(30,70,190,${0.1 + 0.55 * f * f})`);
+    g.addColorStop(0.8, `rgba(50,120,255,${0.3 + 0.5 * f * f})`);
+    g.addColorStop(0.94, "rgba(165,218,255,0.95)");
+    g.addColorStop(1, "rgba(165,218,255,0)");
+    ctx.fillStyle = g; ctx.beginPath(); ctx.arc(SX, SY, rad, 0, 6.2832); ctx.fill();
+    ctx.lineWidth = 2 * u;
+    for (const q of [0.82, 0.66]) {
+      ctx.strokeStyle = `rgba(150,205,255,${0.3 * (1 - f * 0.5)})`;
+      ctx.beginPath(); ctx.arc(SX, SY, rad * q, 0, 6.2832); ctx.stroke();
+    }
+    glow(SX, SY, rad * 1.3, "80,150,255", 0.18);
+    const dsz = (2 + f * 3) * u;
+    ctx.fillStyle = "rgba(200,230,255,0.9)";
+    for (const d of deb) {
+      const dist = rad * d.v * 1.15;
+      ctx.fillRect(SX + Math.cos(d.a) * dist, SY + Math.sin(d.a) * dist, dsz, dsz);
+    }
+    if (rad >= DIAG && wT < 0) wT = nt;
+    if (wT >= 0) {
+      ctx.globalCompositeOperation = "source-over";
+      ctx.fillStyle = `rgba(255,255,255,${cl((nt - wT) / 0.6, 0, 1)})`;
+      ctx.fillRect(-40, -40, W + 80, H + 80);
+      if (nt - wT >= 1.4 && !revealed) showReveal(false);
+      if (nt - wT >= 3) running = false;
+    }
+  }
+  ctx.restore();
+}
+
+/* ---------- reveal ---------- */
+const fmt = (v, p, n) => `${Math.abs(v).toFixed(5)}° ${v >= 0 ? p : n}`;
+function showReveal(instant) {
+  revealed = true;
+  const { lat, lng } = CONFIG.COORDS;
+  document.getElementById("coords").textContent = `${fmt(lat, "N", "S")}, ${fmt(lng, "E", "W")}`;
+  const rt = document.getElementById("revealText");
+  rt.textContent = CONFIG.REVEAL_TEXT || "";
+  rt.style.display = CONFIG.REVEAL_TEXT ? "" : "none";
+  document.getElementById("mapLink").href = `https://www.google.com/maps/search/?api=1&query=${lat},${lng}`;
+  revealEl.style.transition = instant ? "none" : "";
+  revealEl.classList.add("show");
+  ui.style.opacity = 0;
+  if (!DEBUG) store.set(SOLVED_KEY, "1");
+}
+
+/* ---------- debug (?debug) ---------- */
+let dRead = null;
+function buildDebug() {
+  const el = document.getElementById("dbg");
+  el.style.display = "block";
+  dRead = document.createElement("div");
+  el.append(dRead);
+  const sliders = [
+    ["MIN_DB", "Min level (dB)", -80, -20, 1],
+    ["CLARITY", "Clarity", 0.5, 0.98, 0.01],
+    ["HOLD_MS", "Hold to count (ms)", 40, 500, 10],
+    ["WRONG_HOLD_MS", "Wrong-note hold (ms)", 150, 2000, 50],
+    ["SILENCE_RESET_MS", "Silence reset (ms)", 1000, 8000, 250]
+  ];
+  for (const [key, label, mn, mx, st] of sliders) {
+    const l = document.createElement("label"), v = document.createElement("span"), r = document.createElement("input");
+    v.textContent = cfg[key];
+    r.type = "range"; r.min = mn; r.max = mx; r.step = st; r.value = cfg[key];
+    r.oninput = () => { cfg[key] = +r.value; v.textContent = r.value; };
+    l.append(label + ": ", v, r);
+    el.append(l);
+  }
+  const check = (label, key, after) => {
+    const l = document.createElement("label"), cb = document.createElement("input");
+    cb.type = "checkbox"; cb.checked = key === "MATCH" ? cfg.MATCH === "intervals" : cfg[key];
+    cb.onchange = () => {
+      if (key === "MATCH") cfg.MATCH = cb.checked ? "intervals" : "absolute"; else cfg[key] = cb.checked;
+      if (after) after();
+    };
+    l.append(cb, " " + label);
+    el.append(l);
+  };
+  const rematch = () => { buildSteps(); step = 0; candF = null; lastIv = null; renderSim(); };
+  check("Held wrong notes reset", "WRONG_RESETS");
+  check("Match intervals (any key)", "MATCH", rematch);
+  check("Octave matters (intervals only)", "OCTAVE_MATTERS", rematch);
+
+  const simRow = document.createElement("div"), row = document.createElement("div");
+  simRow.style.marginTop = row.style.marginTop = "8px";
+  el.append(simRow, row);
+  const btn = (parent, label, fn) => {
+    const b = document.createElement("button");
+    b.type = "button"; b.textContent = label; b.onclick = fn; parent.append(b);
+    return b;
+  };
+  let shift = 0;
+  function renderSim() {
+    simRow.textContent = "";
+    steps.forEach(s => btn(simRow, NAMES[mod12(s.midi + shift)], () => simNote(s.midi + shift)));
+    btn(simRow, "Wrong", () => simNote(wrongNote()));
+    btn(simRow, `Key ${shift >= 0 ? "+" : ""}${shift}`, () => { shift = shift >= 6 ? -5 : shift + 1; renderSim(); });
+  }
+  renderSim();
+  btn(row, "Supernova", () => { ensureAudio(); solve(); });
+  btn(row, "Reset", resetAll);
+  btn(row, "Copy settings", () => {
+    const s = JSON.stringify({
+      MATCH: cfg.MATCH, OCTAVE_MATTERS: cfg.OCTAVE_MATTERS,
+      MIN_DB: cfg.MIN_DB, CLARITY: cfg.CLARITY, HOLD_MS: cfg.HOLD_MS,
+      WRONG_RESETS: cfg.WRONG_RESETS, WRONG_HOLD_MS: cfg.WRONG_HOLD_MS, SILENCE_RESET_MS: cfg.SILENCE_RESET_MS
+    });
+    try { navigator.clipboard.writeText(s); } catch (e) {}
+    msg(s);
+  });
+
+  // ---- setup: type the melody and coordinates here instead of editing the file ----
+  const setup = document.createElement("div");
+  setup.style.cssText = "margin-top:10px;padding-top:8px;border-top:1px solid rgba(255,255,255,.15)";
+  el.append(setup);
+  const boxStyle = "display:block;width:100%;font:inherit;color:inherit;background:rgba(255,255,255,.06);" +
+    "border:1px solid rgba(255,255,255,.2);border-radius:6px;padding:4px 6px;margin-top:2px;-webkit-user-select:text;user-select:text";
+  const field = (label, value, rows) => {
+    const l = document.createElement("label"), i = document.createElement(rows ? "textarea" : "input");
+    i.value = String(value); i.style.cssText = boxStyle; i.spellcheck = false; i.autocomplete = "off";
+    if (rows) i.rows = rows;
+    l.append(label, i);
+    setup.append(l);
+    return i;
+  };
+  const mIn = field("Melody, e.g. C4 G4:2 Bb (octave optional)",
+    CONFIG.SEQUENCE.map(([n, b]) => (b === 1 ? n : n + ":" + b)).join(" "), 2);
+  const preview = document.createElement("div");
+  setup.append(preview);
+  const latIn = field("Latitude", CONFIG.COORDS.lat);
+  const lngIn = field("Longitude (west is negative)", CONFIG.COORDS.lng);
+  const tIn = field("Line under coordinates (optional)", CONFIG.REVEAL_TEXT);
+  const showPreview = () => {
+    try {
+      const seq = parseMelody(mIn.value);
+      preview.textContent = "Reads as: " + seq.map(([n, b]) => (b === 1 ? n : n + ":" + b)).join(" ") + ` (${seq.length} notes)`;
+      preview.style.color = "";
+      return true;
+    } catch (err) {
+      preview.textContent = err.message;
+      preview.style.color = "#ff9a9a";
+      return false;
+    }
+  };
+  mIn.oninput = showPreview;
+  showPreview();
+  const encodeSetup = () => {
+    const s = { m: mIn.value.trim() };
+    const la = parseFloat(latIn.value), ln = parseFloat(lngIn.value);
+    if (Number.isFinite(la) && Number.isFinite(ln)) { s.lat = la; s.lng = ln; }
+    if (tIn.value.trim()) s.t = tIn.value.trim();
+    return b64e(JSON.stringify(s));
+  };
+  const pageUrl = String(location.href || "").split(/[?#]/)[0];
+  const sRow = document.createElement("div");
+  sRow.style.marginTop = "6px";
+  setup.append(sRow);
+  const linkOut = field("Share link (put this in the QR code)", "");
+  linkOut.readOnly = true;
+  btn(sRow, "Apply & test", () => {
+    if (showPreview()) location.href = pageUrl + "?s=" + encodeSetup() + "&debug";
+  });
+  btn(sRow, "Make share link", () => {
+    if (!showPreview()) return;
+    linkOut.value = pageUrl + "?s=" + encodeSetup();
+    try { linkOut.select(); navigator.clipboard.writeText(linkOut.value); } catch (e) {}
+  });
+  btn(sRow, "Download page", async () => {
+    if (!showPreview()) return;
+    const la = parseFloat(latIn.value), ln = parseFloat(lngIn.value);
+    const settings = Object.assign({}, cfg, {
+      SEQUENCE: parseMelody(mIn.value),
+      COORDS: Number.isFinite(la) && Number.isFinite(ln) ? { lat: la, lng: ln } : CONFIG.COORDS,
+      REVEAL_TEXT: tIn.value.trim()
+    });
+    let src = PAGE_SRC;
+    try {   // the hosted file itself is the cleanest source; fall back to the in-memory copy
+      const r = await fetch(pageUrl, { cache: "no-store" });
+      if (r.ok) { const t = await r.text(); if (t.includes("const CONFIG = {")) src = t; }
+    } catch (e) {}
+    let out;
+    try { out = bakeSource(src, settings); } catch (err) { msg(err.message); return; }
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(new Blob([out], { type: "text/html" }));
+    a.download = "index.html";
+    document.body.append(a);
+    a.click();
+    setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 1000);
+    msg("Downloaded index.html with these settings. Upload it in place of the old one.");
+  });
+}
+
+// Rewrites the CONFIG block of this page's source with new values.
+function bakeSource(src, s) {
+  const start = src.indexOf("const CONFIG = {"), end = src.indexOf("\n};", start);
+  if (start < 0 || end < 0) throw new Error("Couldn't find the CONFIG block to rewrite.");
+  let block = src.slice(start, end);
+  const set = (re, text) => {
+    if (!re.test(block)) throw new Error("Couldn't find " + text.split(":")[0] + " in CONFIG.");
+    block = block.replace(re, () => text);
+  };
+  const seq = s.SEQUENCE.map(([n, b]) => `["${n}", ${+b}]`).join(", ");
+  block = block.replace(/\n\s*\/\/ THIS IS A TEST SCALE[^\n]*/, "");
+  set(/SEQUENCE: \[.*\],/, `SEQUENCE: [${seq}],`);
+  set(/COORDS: \{[^}]*\},/, `COORDS: { lat: ${+s.COORDS.lat}, lng: ${+s.COORDS.lng} },`);
+  set(/\bREVEAL_TEXT: "(?:[^"\\]|\\.)*",/, `REVEAL_TEXT: ${JSON.stringify(s.REVEAL_TEXT || "").replace(/</g, "\\u003c")},`);
+  set(/\bMATCH: "[a-z]+",/, `MATCH: ${JSON.stringify(s.MATCH === "absolute" ? "absolute" : "intervals")},`);
+  set(/\bOCTAVE_MATTERS: (true|false),/, `OCTAVE_MATTERS: ${!!s.OCTAVE_MATTERS},`);
+  set(/\bWRONG_RESETS: (true|false),/, `WRONG_RESETS: ${!!s.WRONG_RESETS},`);
+  for (const k of ["MIN_DB", "CLARITY", "HOLD_MS", "WRONG_HOLD_MS", "SILENCE_RESET_MS"]) {
+    if (!Number.isFinite(+s[k])) throw new Error("Bad value for " + k);
+    set(new RegExp("\\b" + k + ": -?[\\d.]+,"), `${k}: ${+s[k]},`);
+  }
+  return src.slice(0, start) + block + src.slice(end);
+}
+// A note that is neither the next correct note nor a repeat of the last one.
+function wrongNote() {
+  const base = cfg.MATCH === "intervals" && step > 0 ? Math.round(lastF) : 60;
+  for (let k = 1; k < 12; k++) {
+    const m = base + k;
+    if (cfg.MATCH === "intervals") {
+      if (step === 0) return m;
+      const want = steps[step].midi - steps[step - 1].midi;
+      if (mod12(k) !== mod12(want)) return m;
+    } else {
+      const pc = mod12(m);
+      if (pc !== steps[0].pc && (!steps[step] || pc !== steps[step].pc) && (step === 0 || pc !== steps[step - 1].pc)) return m;
+    }
+  }
+  return base + 1;
+}
+function simNote(midi) {
+  ensureAudio();
+  if (phase !== "idle" || !steps.length) return;
+  done = false;
+  judge(midi, Infinity);
+  lastVoiced = performance.now();
+}
+function resetAll() {
+  phase = "idle"; step = 0; ins = 0; wT = -1; miss = 0; parts = []; deb = [];
+  candF = null; samples = []; lastIv = null;
+  revealed = false;
+  revealEl.classList.remove("show"); revealEl.style.transition = "";
+  ui.style.opacity = 1;
+  if (!listening) beginBtn.style.display = "";
+  msg(CONFIG.INSTRUCTION);
+  if (!running) { running = true; lastT = performance.now(); requestAnimationFrame(frame); }
+}
+function updDebug() {
+  if (!dRead) return;
+  const L = live;
+  let note = "—";
+  if (L.freq > 0) {
+    const m = Math.round(L.midiF), c = Math.round((L.midiF - m) * 100);
+    note = `${NAMES[((m % 12) + 12) % 12]}${Math.floor(m / 12) - 1} ${c >= 0 ? "+" : ""}${c}¢`;
+  }
+  dRead.innerHTML =
+    `mic: ${listening ? "on" : "off"} · phase: ${phase}<br>` +
+    `pitch: ${L.freq ? L.freq.toFixed(1) + " Hz" : "—"} · ${note}<br>` +
+    `clarity: ${L.clar.toFixed(2)} · level: ${L.db.toFixed(0)} dB<br>` +
+    `counts: ${L.voiced ? "YES" : "no"} · step: ${step}/${steps.length}<br>` +
+    `match: ${cfg.MATCH}` +
+    (cfg.MATCH === "intervals"
+      ? ` (${cfg.OCTAVE_MATTERS ? "octave matters" : "any octave"}) · last jump: ${lastIv === null ? "—" : (lastIv > 0 ? "+" : "") + lastIv}`
+      : "");
+}
+
+/* ---------- main loop ---------- */
+let lastDbg = 0;
+function updHear(now) {
+  if (listening && live.voiced) { hearEl.textContent = NAMES[live.pc]; hearEl.style.opacity = 1; lastHeard = now; }
+  else if (now - lastHeard > 400) hearEl.style.opacity = 0;
+}
+function frame(now) {
+  if (!running) return;
+  requestAnimationFrame(frame);
+  if (listening && analyser) detect(now);
+  draw(now);
+  updHear(now);
+  if (DEBUG && now - lastDbg > 100) { lastDbg = now; updDebug(); }
+}
+
+msg(setupError || configError || CONFIG.INSTRUCTION);
+if (DEBUG) buildDebug();
+if (store.get(SOLVED_KEY) === "1" && !DEBUG) { showReveal(true); running = false; }
+else requestAnimationFrame(frame);
+</script>
+</body>
+</html>
