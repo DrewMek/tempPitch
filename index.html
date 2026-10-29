@@ -102,10 +102,10 @@ const CONFIG = {
   MATCH: "intervals",
   OCTAVE_MATTERS: false,      // if true, notes must be in the right octaves relative
                               // to each other (up 5 is not down 7)
-  LENIENCY: 0.3,              // average miss allowed per note, 0-1. Higher = more forgiving
-                              // (0.35 starts letting similar tunes through)
-  NOTE_TOLERANCE: 1.5,        // semitones off before a note counts as completely wrong
-                              // (smaller misses cost proportionally less)
+  LENIENCY: 0.3,              // average miss allowed per note, 0-1. Higher = more forgiving,
+                              // but lets more made-up singing through
+  NOTE_TOLERANCE: 0.9,        // semitones off before a note counts as completely wrong
+                              // (smaller misses cost less, bigger ones climb steeply)
   COOLDOWN_S: 3,              // after a run ends without solving (they stop singing), the
                               // stars stop listening this long. 0 turns it off.
 
@@ -395,19 +395,26 @@ function detect(now) {
 // What they sing is split into notes (seg = the note being sung right now, sung = finished
 // notes). The whole run is then scored against the melody at once on a sliding scale, with the
 // key allowed to drift, so it judges whether they've got the tune rather than each note.
-let sung = [];             // finished notes this attempt: { p: pitch (fractional MIDI), ms }
+let sung = [];             // finished notes this attempt: { p: pitch (fractional MIDI), ms, canStart }
 let seg = null;            // the note being sung right now: { start, p, samples, devSince, last }
 let smooth = [];           // last few raw pitches; their median tames vibrato and detector glitches
 let fit = null;            // latest scoring: { progress, cost, key }
 let dirty = false, lastScore = 0;
 const SPLIT = 0.6;         // semitones away from the current note before it might be a new note...
 const SPLIT_MS = 60;       // ...and it has to stay away this long (vibrato swings back sooner)
-// Score costs. A note's miss is (semitones off / NOTE_TOLERANCE)^2, capped at 1.
-const DRIFT = 0.3;         // per semitone the key moves between two melody notes (singing by ear)
-const SKIP = 1;            // a melody note they didn't sing
-const EXTRA = 0.8;         // an extra note that doesn't fit...
-const EXTRA_SHORT = 0.15;  // ...or a short one (a slide or scoop between notes)
+// Score costs. A note off by e x NOTE_TOLERANCE costs e^2 up to 1; past that it climbs steeply.
+const SC = {
+  MISS_STEEP: 2,           // extra cost per NOTE_TOLERANCE beyond the tolerance (very wrong notes)
+  DRIFT: 0.3,              // per semitone the key moves between two melody notes (singing by ear)...
+  DRIFT_FREE: 0.75,        // ...up to this many semitones;
+  DRIFT_STEEP: 1.2,        // beyond it, per semitone (a jump sung very wrong)
+  SKIP: 1,                 // a melody note they didn't sing
+  EXTRA: 0.8,              // an extra note that doesn't fit...
+  EXTRA_SHORT: 0.15        // ...or a short one (a slide or scoop between notes)
+};
 const GLITCH_MS = 220;
+const FREE_LEAD = 3;       // the melody has to start within this many notes of the start of a run...
+const RESTART_PAUSE_MS = 700;   // ...or of a pause at least this long (a restart)
 const SETTLE_MS = 200;     // the note being sung must be held this long before it can complete the melody
 const KSTEP = 0.25;        // key resolution, semitones
 const wrap = v => v - 12 * Math.round(v / 12);
@@ -416,7 +423,8 @@ function median(a) {
   const s = a.slice().sort((x, y) => x - y), m = s.length >> 1;
   return s.length % 2 ? s[m] : (s[m - 1] + s[m]) / 2;
 }
-function newAttempt() { step = 0; sung = []; seg = null; smooth = []; fit = null; cache = null; }
+let sinceBreak = 0, lastNoteEnd = -Infinity;   // notes since the last pause, and when the last note ended
+function newAttempt() { step = 0; sung = []; seg = null; smooth = []; fit = null; cache = null; sinceBreak = 0; lastNoteEnd = -Infinity; }
 
 // Short cooldown after a run that ended without solving. It survives a reload (stored with a
 // wall-clock end time), so refreshing doesn't skip it.
@@ -443,7 +451,10 @@ function handle(now, voiced, mf) {
     if (seg && !exactOctave()) mf = seg.p + wrap(mf - seg.p);   // detector octave slips stay on the note
     smooth.push(mf); if (smooth.length > 5) smooth.shift();
     const sp = median(smooth);
-    if (!seg) seg = { start: now, p: sp, samples: [sp], devSince: 0, last: now };
+    if (!seg) {
+      if (now - lastNoteEnd >= RESTART_PAUSE_MS) sinceBreak = 0;   // after a pause they may be starting over
+      seg = { start: now, p: sp, samples: [sp], devSince: 0, last: now };
+    }
     else if (Math.abs(fold(sp - seg.p)) > SPLIT) {
       if (!seg.devSince) seg.devSince = now;
       if (now - seg.devSince >= SPLIT_MS) {                       // it really moved: a new note
@@ -460,7 +471,7 @@ function handle(now, voiced, mf) {
     dirty = true;
   } else {
     if (!unvoicedSince) unvoicedSince = now;
-    if (seg && now - unvoicedSince > 250) { closeSeg(seg.last); seg = null; smooth = []; }   // short dropouts keep the note going
+    if (seg && now - unvoicedSince > 250) { closeSeg(seg.last); lastNoteEnd = seg.last; seg = null; smooth = []; }   // short dropouts keep the note going
     if ((sung.length || seg) && now - lastVoiced > cfg.SILENCE_RESET_MS) {   // they stopped: this run is over
       if (step >= 2) { miss = 1; startCooldown(); }
       newAttempt();
@@ -471,7 +482,8 @@ function handle(now, voiced, mf) {
 function closeSeg(end) {
   const ms = end - seg.start;
   if (ms >= cfg.MIN_NOTE_MS) {
-    sung.push({ p: seg.p, ms });
+    sung.push({ p: seg.p, ms, canStart: sinceBreak < FREE_LEAD });
+    sinceBreak++;
     if (sung.length > steps.length * 2 + 8) sung.shift();
   }
   dirty = true;
@@ -482,53 +494,55 @@ function closeSeg(end) {
 // and each update only adds the note being sung right now.
 //   D[j][k] = cheapest way to explain everything sung so far, reaching melody note j in key k
 //   G[j][k] = the same, but melody note j must actually have been sung (nothing unsung counts)
-// Sung notes before the melody starts are free (warming up, an earlier try).
+// Sung notes before the melody starts are free (warming up, an earlier try), but the melody can only
+// start on a note sung near the start of a run or right after a pause, not in the middle of a ramble.
 let cache = null;
 function keyGrid() {
   const ks = [];
   if (cfg.MATCH !== "intervals") for (let k = -1; k <= 1.0001; k += KSTEP) ks.push(k);
   else if (exactOctave()) for (let k = -36; k <= 36.0001; k += KSTEP) ks.push(k);
   else for (let k = 0; k < 12 - 1e-9; k += KSTEP) ks.push(k);
-  return { ks, circ: cfg.MATCH === "intervals" && !exactOctave() };
+  const K = ks.length, circ = cfg.MATCH === "intervals" && !exactOctave(), dc = new Float64Array(K * K);
+  for (let a = 0; a < K; a++) for (let b = 0; b < K; b++) {
+    let d = Math.abs(ks[a] - ks[b]); if (circ) d = Math.min(d, 12 - d);
+    dc[a * K + b] = d <= SC.DRIFT_FREE ? SC.DRIFT * d : SC.DRIFT * SC.DRIFT_FREE + SC.DRIFT_STEEP * (d - SC.DRIFT_FREE);
+  }
+  return { ks, circ, dc };
 }
 function emptyTable(K) {
   const n = steps.length, D = new Float64Array((n + 1) * K), G = new Float64Array((n + 1) * K).fill(Infinity);
-  for (let j = 1; j <= n; j++) D.fill(j * SKIP, j * K, (j + 1) * K);
+  for (let j = 1; j <= n; j++) D.fill(j * SC.SKIP, j * K, (j + 1) * K);
   return { D, G };
 }
-// t[q] = min over q' of t[q'] + DRIFT * (key distance): lets the key move between notes.
-function drift(t, circ) {
-  const K = t.length, c = DRIFT * KSTEP;
-  if (circ) {
-    for (let i = 1; i < 2 * K; i++) { const q = i % K, p = (i - 1) % K; if (t[p] + c < t[q]) t[q] = t[p] + c; }
-    for (let i = 2 * K - 2; i >= 0; i--) { const q = i % K, p = (i + 1) % K; if (t[p] + c < t[q]) t[q] = t[p] + c; }
-  } else {
-    for (let q = 1; q < K; q++) if (t[q - 1] + c < t[q]) t[q] = t[q - 1] + c;
-    for (let q = K - 2; q >= 0; q--) if (t[q + 1] + c < t[q]) t[q] = t[q + 1] + c;
-  }
-}
 function addNote(tab, note, grid) {
-  const n = steps.length, { ks, circ } = grid, K = ks.length, E = cfg.NOTE_TOLERANCE, oct = exactOctave();
+  const n = steps.length, { ks, dc } = grid, K = ks.length, E = cfg.NOTE_TOLERANCE, oct = exactOctave();
   const { D, G } = tab, nD = new Float64Array((n + 1) * K), nG = new Float64Array((n + 1) * K).fill(Infinity);
-  const extra = note.ms < GLITCH_MS ? EXTRA_SHORT : EXTRA, t = new Float64Array(K);
+  const extra = note.ms < GLITCH_MS ? SC.EXTRA_SHORT : SC.EXTRA, t = new Float64Array(K);
+  const start = note.canStart === false ? Infinity : 0;      // can the melody begin on this note?
   for (let j = 1; j <= n; j++) {
-    for (let q = 0; q < K; q++) t[q] = D[(j - 1) * K + q];
-    drift(t, circ);
+    if (j === 1) t.fill(start);
+    else for (let q = 0; q < K; q++) {                       // best previous note, letting the key move
+      let m = Infinity; const base = (j - 1) * K, rowc = q * K;
+      for (let q2 = 0; q2 < K; q2++) { const v = D[base + q2] + dc[rowc + q2]; if (v < m) m = v; }
+      t[q] = m;
+    }
     const mj = steps[j - 1].midi, row = j * K, prevRow = (j - 1) * K;
     for (let q = 0; q < K; q++) {
       const d = note.p - ks[q] - mj, e = Math.abs(oct ? d : d - 12 * Math.round(d / 12)) / E;
-      const miss = e >= 1 ? 1 : e * e;
+      const miss = e <= 1 ? e * e : 1 + SC.MISS_STEEP * (e - 1);
       const sing = t[q] + miss;                          // this note is melody note j
       const again = Math.min(extra, miss);               // or extra; a repeat of note j costs only its miss
-      nD[row + q] = Math.min(sing, D[row + q] + again, nD[prevRow + q] + SKIP);
+      const skipFrom = j === 1 ? start : nD[prevRow + q];
+      nD[row + q] = Math.min(sing, D[row + q] + again, skipFrom + SC.SKIP);
       nG[row + q] = Math.min(sing, G[row + q] + again);
     }
   }
   return { D: nD, G: nG };
 }
 function ensureCache() {
-  const grid = keyGrid(), sig = [cfg.MATCH, exactOctave(), cfg.NOTE_TOLERANCE, steps.map(t => t.midi).join(",")].join("|");
+  const sig = [cfg.MATCH, exactOctave(), cfg.NOTE_TOLERANCE, JSON.stringify(SC), steps.map(t => t.midi).join(",")].join("|");
   if (!cache || cache.sig !== sig || cache.count > sung.length || cache.first !== sung[0]) {
+    const grid = keyGrid();
     cache = { sig, grid, tab: emptyTable(grid.ks.length), count: 0, first: sung[0] };
   }
   while (cache.count < sung.length) cache.tab = addNote(cache.tab, sung[cache.count++], cache.grid);
@@ -539,7 +553,7 @@ function ensureCache() {
 // melody, which never runs ahead by assuming they skipped a note.
 function rescore(now) {
   ensureCache();
-  const live = seg && now - seg.start >= cfg.MIN_NOTE_MS ? { p: seg.p, ms: now - seg.start } : null;
+  const live = seg && now - seg.start >= cfg.MIN_NOTE_MS ? { p: seg.p, ms: now - seg.start, canStart: sinceBreak < FREE_LEAD } : null;
   const tab = live ? addNote(cache.tab, live, cache.grid) : cache.tab;
   const n = steps.length, K = cache.grid.ks.length;
   let best = { progress: 0, cost: 0, key: fit ? fit.key : 0 }, bestRank = 0, solved = false;
@@ -965,7 +979,10 @@ function simNote(midi) {
   ensureAudio();
   if (phase !== "idle" || !steps.length || cooling()) return;
   seg = null; smooth = [];
-  sung.push({ p: midi, ms: 300 });
+  const now = performance.now();
+  if (now - lastNoteEnd >= RESTART_PAUSE_MS + 300) sinceBreak = 0;
+  sung.push({ p: midi, ms: 300, canStart: sinceBreak < FREE_LEAD });
+  sinceBreak++; lastNoteEnd = now;
   rescore(performance.now());
   lastVoiced = performance.now();
 }
