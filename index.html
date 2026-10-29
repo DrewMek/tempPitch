@@ -795,6 +795,20 @@ function showReveal(instant) {
   ui.style.opacity = 0;
   if (!DEBUG) store.set(SOLVED_KEY, "1");
 }
+// Hidden reset for testing: tap the white screen 5 times within 2 seconds and the page forgets
+// it was solved (and any cooldown), then starts over.
+let revealTaps = [];
+function revealTap(e) {
+  if (e && e.target && e.target.closest && e.target.closest("#mapLink")) return;
+  const now = Date.now();
+  revealTaps = revealTaps.filter(t => now - t < 2000);
+  revealTaps.push(now);
+  if (revealTaps.length < 5) return;
+  revealTaps = [];
+  store.del(SOLVED_KEY); store.del(COOL_KEY);
+  location.reload();
+}
+revealEl.addEventListener("click", revealTap);
 
 /* ---------- debug (?debug) ---------- */
 let dRead = null;
